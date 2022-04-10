@@ -1,11 +1,45 @@
 import torch
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
 import copy
-from torch.autograd import Variable
+import numpy as np
 
 def copy_layer(module,N):
     return nn.Sequential(*[copy.deepcopy(module) for i in range(N)])
+
+def copy_layer_list(module,N):
+    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+
+class CCT(nn.Module):
+    def __init__(self,args):
+        super(CCT, self).__init__()
+        self.conv_num=args.conv_num
+        self.kernel_size=args.kernel_size
+        self.inputs=args.inputs
+        self.mids=args.mids
+        self.outputs=args.outputs      #Embeding的长度d_model
+        self.encoder_num = args.encoder_num
+        self.h=args.h
+        self.drop=args.drop
+
+        self.embed=ConvEmbed(self.inputs,self.kernel_size,self.mids,self.outputs,self.conv_num)
+        self.transformer=copy_layer(Encoder(self.h,self.outputs,self.drop),self.encoder_num)
+        self.seqpool=nn.Sequential(SeqPool(self.outputs))
+        self.classify=nn.Linear(self.outputs,10)
+
+        self.apply(CCT.init_weight)
+
+    @staticmethod
+    def init_weight(m):
+        if isinstance(m,nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight)
+
+    def forward(self,x):
+        x=self.embed(x)    #Embed大小:N*d_token*(HW)
+        x=self.transformer(x)
+        x=self.seqpool(x)
+        return self.classify(x)
+
 
 class ConvEmbed(nn.Module):
     @staticmethod
@@ -26,16 +60,94 @@ class ConvEmbed(nn.Module):
         x=self.layer3(x)    #x的size:N*d_token*H*W
         x=x.contiguous()
         N,d,H,W=x.size()
-        return x.view(N,d,H*W)
+        return x.view(N,d,H*W).transpose(1,2).contiguous()   #N*(H/2W/2)*d
 
-t=ConvEmbed()
-x=torch.arange(4*4*3).view(1,3,4,4).float()
-x=nn.Dropout(0.5)(x)
-m = nn.Dropout(p=0.5)
-a=Variable(torch.tensor([5.,4.]),requires_grad=True)
-b=Variable(torch.tensor([2.,3.]))
-y=(a**2+5*b)
-z=y.mean()
-z.backward()
-print(a.grad)
-print(b.grad)
+class Encoder(nn.Module):
+    def __init__(self,h=32,d_model=512,drop=0.1):
+        super(Encoder, self).__init__()
+        self.h=h
+        self.d_model=d_model
+        self.drop=drop
+
+        self.norm=nn.LayerNorm(d_model)
+        self.layer1=MultiHead(self.h,self.d_model,self.drop)
+        self.layer2=nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(self.d_model, 2 * self.d_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(self.drop),
+            nn.Linear(2*self.d_model,d_model),
+            nn.ReLU(inplace=True),
+            nn.Dropout(self.drop),
+        )
+
+    def forward(self,x):
+        x=self.norm(x)
+        out=self.layer1(x,x,x)+x
+        x=out
+        x=x+self.layer2(out)
+        return x
+
+class MultiHead(nn.Module):
+    def __init__(self,h=8,d_model=512,drop=0.1):
+        super(MultiHead, self).__init__()
+        assert d_model%h==0
+        self.h=h
+        self.d_model=d_model
+        self.d_head=d_model//self.h
+        self.drop=nn.Dropout(drop)
+        self.norm = copy_layer_list(nn.LayerNorm(d_model),3)
+        self.linearhead=copy_layer_list(nn.Linear(self.d_model,self.d_model),4)
+
+    @staticmethod
+    def make_mask(size):
+        mask=np.triu(np.ones((size,size)),k=1).astype('uint8')
+        return torch.from_numpy(mask)==0
+
+    @staticmethod
+    def attention(query,key,value,mask,dropout):
+        d_k=query.size(-1)
+        score=torch.matmul(query,key.transpose(-1,-2))/d_k**0.5
+        if mask is not None:
+            score=score.masked_fill(mask==0,-1e9)
+        atten=F.softmax(score,-1)
+        if dropout is not None:
+            atten=dropout(atten)
+        return torch.matmul(atten,value)
+
+    def forward(self,query,key,value):
+        N_batch=query.size(0)
+        query,key,value=[n(x) for n,x in zip(self.norm,(query,key,value))]
+        query,key,value=[l(x).view(N_batch,-1,self.h,self.d_head).transpose(1,2) for l,x in zip(self.linearhead,(query,key,value))]   #q,k,v:N*h*length*d_head
+        mask=MultiHead.make_mask(query.size(2))
+        x=MultiHead.attention(query,key,value,mask,self.drop).transpose(1,2).contiguous().view(N_batch,-1,self.d_model)
+        return self.linearhead[-1](x)
+
+class SeqPool(nn.Module):
+    def __init__(self,d_model):
+        super(SeqPool, self).__init__()
+        self.d_model=d_model
+
+        self.linear=nn.Linear(self.d_model,1)
+    def forward(self,x):
+        x_l=self.linear(x).transpose(1,2).contiguous()
+        x_l=F.softmax(x_l,-1)
+        return torch.matmul(x_l,x)
+
+class param():
+    def __init__(self,conv_num,ker_size,inputs,mids,outpus,encoder_num,h,drop):
+        self.conv_num=conv_num
+        self.kernel_size=ker_size
+        self.inputs=inputs
+        self.mids=mids
+        self.outputs=outpus
+        self.encoder_num=encoder_num
+        self.h=h
+        self.drop=drop
+
+args=param(6,7,3,64,512,6,8,0.1)
+model=CCT(args)
+x=torch.arange(5*3*32*32).view(5,3,32,32).float()
+y=model(x)
+print(x.size())
+print(y.size())
