@@ -2,4 +2,7 @@
 /shelf/
 /workspace.xml
 /.idea
-
+/__pycache__
+/data
+/model
+/picdata

@@ -13,12 +13,12 @@ def copy_layer_list(module,N):
 class CCT(nn.Module):
     def __init__(self,args):
         super(CCT, self).__init__()
-        self.conv_num=args.conv_num
-        self.kernel_size=args.kernel_size
-        self.inputs=args.inputs
+        self.conv_num=args.convnum
+        self.kernel_size=args.kernelsize
+        self.inputs=3
         self.mids=args.mids
         self.outputs=args.outputs      #Embeding的长度d_model
-        self.encoder_num = args.encoder_num
+        self.encoder_num = args.encodernum
         self.h=args.h
         self.drop=args.drop
 
@@ -38,7 +38,7 @@ class CCT(nn.Module):
         x=self.embed(x)    #Embed大小:N*d_token*(HW)
         x=self.transformer(x)
         x=self.seqpool(x)
-        return self.classify(x)
+        return self.classify(x).squeeze(1)
 
 
 class ConvEmbed(nn.Module):
@@ -51,12 +51,15 @@ class ConvEmbed(nn.Module):
     def __init__(self,inputs=3,kernel_size=3,mids=64,outputs=512,conv_num=7):  #输入通道数、卷积核的大小、中间层卷积核的个数、最终输出的通道数（token的维度数）、卷积层的个数
         super(ConvEmbed, self).__init__()
         self.layer1=ConvEmbed.make_convs(inputs,mids,k_size=kernel_size,p_size=3,p_stride=1,p_pad=1)
-        self.layer2=copy_layer(ConvEmbed.make_convs(mids,mids,k_size=kernel_size,p_size=3,p_stride=1,p_pad=1),conv_num-2)
+        self.layer2=None
+        if conv_num>2:
+            self.layer2=copy_layer(ConvEmbed.make_convs(mids,mids,k_size=kernel_size,p_size=3,p_stride=1,p_pad=1),conv_num-2)
         self.layer3=ConvEmbed.make_convs(mids,outputs,k_size=kernel_size,p_size=3,p_stride=2,p_pad=1)
 
     def forward(self,x):
         x=self.layer1(x)
-        x=self.layer2(x)
+        if self.layer2 is not None:
+            x=self.layer2(x)
         x=self.layer3(x)    #x的size:N*d_token*H*W
         x=x.contiguous()
         N,d,H,W=x.size()
@@ -102,13 +105,15 @@ class MultiHead(nn.Module):
     @staticmethod
     def make_mask(size):
         mask=np.triu(np.ones((size,size)),k=1).astype('uint8')
-        return torch.from_numpy(mask)==0
+        mask=torch.from_numpy(mask)==0
+        return mask.cuda()
 
     @staticmethod
     def attention(query,key,value,mask,dropout):
         d_k=query.size(-1)
         score=torch.matmul(query,key.transpose(-1,-2))/d_k**0.5
         if mask is not None:
+
             score=score.masked_fill(mask==0,-1e9)
         atten=F.softmax(score,-1)
         if dropout is not None:
