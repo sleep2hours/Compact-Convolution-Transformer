@@ -25,7 +25,8 @@ class CCT(nn.Module):
         self.embed=ConvEmbed(self.inputs,self.kernel_size,self.mids,self.outputs,self.conv_num)
         self.transformer=copy_layer(Encoder(self.h,self.outputs,self.drop),self.encoder_num)
         self.seqpool=nn.Sequential(SeqPool(self.outputs))
-        self.classify=nn.Linear(self.outputs,10)
+        self.MLP=nn.Linear(self.outputs,self.outputs*2)
+        self.classify=nn.Linear(self.outputs*2,10)
 
         self.apply(CCT.init_weight)
 
@@ -38,6 +39,7 @@ class CCT(nn.Module):
         x=self.embed(x)    #Embed大小:N*d_token*(HW)
         x=self.transformer(x)
         x=self.seqpool(x)
+        x=self.MLP(x)
         return self.classify(x).squeeze(1)
 
 
